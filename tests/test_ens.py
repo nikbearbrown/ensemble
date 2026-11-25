@@ -217,5 +217,91 @@ class Projects(unittest.TestCase):
         self.assertIn("FAIL", out)
 
 
+class Pruning(unittest.TestCase):
+    def test_prune_drops_noise_members_and_keeps_useful_ones(self):
+        rng = np.random.default_rng(5)
+        y = rng.normal(size=4000)
+        good = [y + rng.normal(size=4000) for _ in range(3)]
+        junk = [rng.normal(size=4000) * 5 for _ in range(2)]
+        w = ens.prune("regression", "rmse", y, np.array(good + junk), 0.01)
+        self.assertTrue(np.allclose(w, [1 / 3, 1 / 3, 1 / 3, 0, 0]), w)
+
+    def test_prune_reduces_clones_to_one(self):
+        rng = np.random.default_rng(6)
+        y = rng.normal(size=2000)
+        base = y + rng.normal(size=2000)
+        w = ens.prune("regression", "rmse", y, np.array([base, base + 1e-6, base - 1e-6]), 0.01)
+        self.assertEqual(int((w > 0).sum()), 1)
+
+
+try:
+    import pandas as pd
+    import sklearn  # noqa: F401
+    HAVE_ML = True
+except ImportError:
+    HAVE_ML = False
+
+
+@unittest.skipUnless(HAVE_ML, "pandas and scikit-learn are needed for profile, suggest and build")
+class FromData(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        rng = np.random.default_rng(0)
+        n = 1500
+        cust = rng.integers(0, 150, n)
+        x1, x2 = rng.normal(size=n), rng.normal(size=n)
+        plan = rng.choice(["basic", "plus", "pro"], n)
+        y = (x1 + 0.8 * (plan == "basic") + np.sin(3 * x2) + rng.normal(size=n) > 0.5).astype(int)
+        x2m = x2.copy()
+        x2m[rng.random(n) < 0.1] = np.nan
+        self.csv = Path(self.tmp.name) / "data.csv"
+        pd.DataFrame({"row_id": np.arange(n), "customer_id": cust, "x1": x1, "x2": x2m, "plan": plan,
+                      "day": pd.Timestamp("2024-01-01") + pd.to_timedelta(rng.integers(0, 300, n), unit="D"),
+                      "answer": y + rng.normal(0, 0.01, n), "label": np.where(y == 1, "yes", "no")}).to_csv(self.csv, index=False)
+        self.proj = Path(self.tmp.name) / "proj"
+
+    def test_profile_flags_leak_group_and_date(self):
+        code, out = run("profile", str(self.csv), "--target", "label", "--project", str(self.proj), "--id", "row_id")
+        self.assertEqual(code, 0)
+        self.assertIn('"answer" correlates', out)
+        self.assertIn("--group customer_id", out)
+        self.assertIn("--time day", out)
+        prof = json.loads((self.proj / "profile.json").read_text())
+        self.assertEqual(prof["task"], "binary")
+        kinds = {c["name"]: c["kind"] for c in prof["columns"]}
+        self.assertEqual(kinds["customer_id"], "entity")
+        self.assertEqual(kinds["plan"], "categorical")
+        self.assertIsNone(json.loads((self.proj / "ensemble.json").read_text())["min_gain"])
+
+    def test_suggest_skips_what_the_data_cannot_support(self):
+        run("profile", str(self.csv), "--target", "label", "--project", str(self.proj), "--id", "row_id", "--drop", "answer")
+        code, out = run("suggest", str(self.proj))
+        self.assertEqual(code, 0)
+        cands = {c["name"]: c for c in json.loads((self.proj / "candidates.json").read_text())}
+        self.assertTrue(cands["linear"]["build"] and cands["boost"]["build"] and cands["forest"]["build"])
+        self.assertFalse(cands["mlp"]["build"])                      # 1,500 rows: under 2,000
+        self.assertIn("skipped_because", cands["mlp"])
+        self.assertFalse(cands["boost_slow"]["build"])               # tier 3 waits for evidence
+        self.assertTrue((self.proj / "PLAN.md").exists() and (self.proj / "build_members.py").exists())
+
+    def test_build_refuses_without_min_gain_then_runs_to_a_verdict(self):
+        run("profile", str(self.csv), "--target", "label", "--project", str(self.proj), "--id", "row_id",
+            "--group", "customer_id", "--drop", "answer")
+        run("suggest", str(self.proj))
+        self.assertEqual(run("build", str(self.proj))[0], 1)
+        cfg = json.loads((self.proj / "ensemble.json").read_text())
+        self.assertEqual(cfg["split"], "group")
+        cfg["min_gain"] = 0.005
+        (self.proj / "ensemble.json").write_text(json.dumps(cfg))
+        import subprocess
+        r = subprocess.run([sys.executable, str(self.proj / "build_members.py"), "--only", "linear,boost"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-500:])
+        self.assertEqual(run("check", str(self.proj))[0], 0)         # groups stay on one side, ids align
+        self.assertEqual(run("blend", str(self.proj))[0], 0)
+        self.assertIn("VERDICT", run("verdict", str(self.proj), "--boot", "200")[1])
+
+
 if __name__ == "__main__":
     unittest.main()

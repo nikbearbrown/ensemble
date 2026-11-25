@@ -5,7 +5,7 @@ description: Step-by-step procedure for building a machine-learning ensemble and
 
 # Build an ensemble
 
-Work through the steps in order. Each ends with something you can show the user. Rule numbers refer to `docs/rules.md`.
+If you are starting from a data file and no models exist yet, do `skills/choose-models/SKILL.md` first: it covers steps 1 to 4 here with the tool doing the building, and hands back at step 5. Otherwise work through the steps in order. Each ends with something you can show the user. Rule numbers refer to `docs/rules.md`.
 
 ## 1. Look before you build
 
@@ -56,7 +56,7 @@ Classification members must output probabilities. A margin or a raw boosting sco
 
 Read `members` for three things: each member's own score, the pairs that make the same mistakes, and the share of rows every member gets wrong. No combination fixes the last.
 
-Read `blend` in this order: does the equal-weight average clear `min_gain` over the best single model; do learned weights clear the average by `min_gain`; what does removing each member cost. A member marked "hurts" or "under min_gain" comes out unless there is a stated reason to keep it (a slice it rescues, say), and then `blend` runs again. Changing the member list is selection; it is allowed here, on development rows, and nowhere later.
+Read `blend` in this order: does the equal-weight average clear `min_gain` over the best single model; do learned weights clear the average by `min_gain`; what does removing each member cost. The pruned average does this removal for you and `blend` prints "Members to keep". A member marked "hurts" or "under min_gain" comes out unless there is a stated reason to keep it (a slice it rescues, say), and then `blend` runs again. Changing the member list is selection; it is allowed here, on development rows, and nowhere later.
 
 If `blend` chooses the single model, the honest options are to stop, or to go back to step 4 for a member that is different in kind. More of the same family has not moved it and will not.
 

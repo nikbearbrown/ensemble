@@ -1,11 +1,13 @@
 ---
 name: ensemble
-description: Builds, evaluates and reviews machine-learning ensembles (bagging, boosting, voting, blending, stacking, deep ensembles) for classification, regression and forecasting, and decides with evidence whether the ensemble earns its extra cost over the best single model. Use when the user asks to ensemble, blend, stack or average models, combine forecasts, improve a model by combining others, or review or audit ensemble or stacking code for leakage. Works on saved predictions keyed by row id, with a command-line tool (./ens) that checks alignment, measures whether members make different mistakes, compares a single model with simple and learned blends, and scores one locked recipe on an untouched holdout. These are ensembles of predictive models, not groups of AI agents.
+description: Decides which machine-learning models to build and try for a prediction problem, builds them, and decides with evidence whether combining them (bagging, boosting, voting, blending, stacking, deep ensembles) earns its extra cost over the best single model. For classification, regression and forecasting. Use when the user points at a dataset and asks which models to try, asks for a model or an ensemble to be built, asks to ensemble, blend, stack or average models or combine forecasts, or asks for a review of ensemble or stacking code for leakage. A command-line tool (./ens) profiles the data, suggests a first set of models that differ in kind, trains them inside proper folds, checks alignment, measures whether members make different mistakes, compares a single model with simple and learned blends, and scores one locked recipe on an untouched holdout. These are ensembles of predictive models, not groups of AI agents.
 ---
 
 # ensemble
 
-An ensemble works for one reason: competent models that make different mistakes cancel some of them when combined. Most ensembles that disappoint were not badly combined. They were badly evaluated: the weights, the member list or the stacker were chosen on the same rows that then reported the score. This skill builds the ensemble in an order that keeps the evaluation honest, and measures the result instead of trusting it.
+The first job is choosing which models to build. The user points at data and describes the problem; you decide which models are worth trying, build them so they can be compared fairly, and let the evidence say which to keep.
+
+An ensemble works for one reason: competent models that make different mistakes cancel some of them when combined. So the models worth building are the ones that differ in kind, not the ones that are easy to add. Most ensembles that disappoint were not badly combined. They were badly evaluated: the weights, the member list or the stacker were chosen on the same rows that then reported the score. This skill builds the ensemble in an order that keeps the evaluation honest, and measures the result instead of trusting it.
 
 The rules and their sources are in `docs/rules.md`. Read it once before your first ensemble. The numbers below (rule 11, rule 13) are its numbers.
 
@@ -13,7 +15,8 @@ The rules and their sources are in `docs/rules.md`. Read it once before your fir
 
 | The user wants | Read |
 |---|---|
-| An ensemble built, or an existing set of models combined | `skills/build-ensemble/SKILL.md` |
+| To know which models to build for a dataset, and to have them built | `skills/choose-models/SKILL.md`, then build-ensemble |
+| An existing set of models or predictions combined and judged | `skills/build-ensemble/SKILL.md` |
 | A review of ensemble or stacking code, a notebook, or a claimed result | `skills/review-ensemble/SKILL.md` |
 | To know the file layout the tool reads | `docs/file-format.md` |
 
@@ -35,20 +38,26 @@ The rules and their sources are in `docs/rules.md`. Read it once before your fir
 ## The loop
 
 ```
-purpose, metric, min_gain  ->  split  ->  members, each as out-of-fold + holdout predictions
+data + problem  ->  ./ens profile (task, split, leak warnings)  ->  ./ens suggest (which models, why)
+   ->  you edit the list  ->  min_gain  ->  ./ens build (out-of-fold + holdout predictions)  ->  tune the best one
    ->  ./ens check  ->  ./ens members  ->  ./ens blend (locks one recipe)
    ->  ./ens verdict (opens the holdout once)  ->  slices, shift, cost  ->  keep it or ship the single model
 ```
 
-`./ens check` reads the files: ids, folds, scale, groups, time order. `./ens members` scores each member alone and shows whether they make the same mistakes. `./ens blend` compares the best single model, the equal-weight average, learned weights and greedy selection, each fold blended by a recipe fitted on the other folds, and picks the simplest that clears `min_gain`. `./ens verdict` gives KEEP, TOO SMALL or NOT SHOWN. Every blend and verdict run is added to `RECORD.md` in the project, including the ones that did not go the user's way. Do not delete entries.
+`./ens profile` reads the data and `./ens suggest` proposes a first set of models from its shape: rules of thumb, which you are expected to edit with what you know about the problem. `./ens build` trains them. `./ens check` reads the files: ids, folds, scale, groups, time order. `./ens members` scores each member alone and shows whether they make the same mistakes. `./ens blend` compares the best single model, the equal-weight average of all members, a pruned average, learned weights and greedy selection, each fold blended by a recipe fitted on the other folds, picks the simplest that clears `min_gain`, and says which members to keep. `./ens verdict` gives KEEP, TOO SMALL or NOT SHOWN. Every blend and verdict run is added to `RECORD.md` in the project, including the ones that did not go the user's way. Do not delete entries.
 
-The tool cannot judge five things, and you must: whether the split matches deployment, whether the base models were tuned without seeing their own validation rows, whether the single-model baseline was tuned fairly, how the result holds on the slices and shifts that matter, and whether the gain is worth the serving cost.
+The tool cannot judge six things, and you must: whether a flagged column is a leak, whether the split matches deployment, whether the base models were tuned without seeing their own validation rows, whether the single-model baseline was tuned fairly, how the result holds on the slices and shifts that matter, and whether the gain is worth the serving cost.
 
 ## Commands
 
 ```
-./ens new <project> --task binary|multiclass|regression [--split kfold|group|time]
-./ens demo <project>          a worked example on synthetic data (needs scikit-learn)
+./ens profile <data> --target <col> --project <project> [--id c] [--group c] [--time c] [--drop c1,c2]
+./ens suggest <project>       which models to build first, hold back, or skip, and why
+./ens build <project> [--only a,b] [--list]
+
+./ens new <project> --task binary|multiclass|regression [--split kfold|group|time]   (you already have predictions)
+./ens demo <project>          a worked example on synthetic data
+
 ./ens check <project>
 ./ens members <project>
 ./ens blend <project>
@@ -56,8 +65,8 @@ The tool cannot judge five things, and you must: whether the split matches deplo
 ./ens lint <path>             reads Python for leakage patterns: hints to read, not proof
 ```
 
-Needs Python 3.9 or newer and numpy. The tool reads CSV files, so the models can come from any library. `templates/make_predictions.py` is a scikit-learn starting point that writes the files correctly.
+Needs Python 3.9 or newer and numpy; `profile`, `suggest` and `build` also need pandas and scikit-learn. The evaluation commands read CSV files, so members can come from any library. `build_members.py` (copied into the project by `suggest`) is the script you edit to add your own.
 
 ## What this skill does not do
 
-It does not train or tune base models for you beyond the template, serve the ensemble, or fit a non-linear stacker. For a stacker with interactions or original features, use scikit-learn's `StackingClassifier` or `StackingRegressor` (they make the out-of-fold predictions internally through `cv`), save the stack's own out-of-fold and holdout predictions as one more member, and let `./ens` compare it with the single model and the plain average like anything else.
+It does not tune models (the build script runs them near their defaults, and tuning the strongest one is your step), engineer features, serve the ensemble, or fit a non-linear stacker. The suggestions come from the data's shape only; the domain knowledge is yours to add. For a stacker with interactions or original features, use scikit-learn's `StackingClassifier` or `StackingRegressor` (they make the out-of-fold predictions internally through `cv`), save the stack's own out-of-fold and holdout predictions as one more member, and let `./ens` compare it with the single model and the plain average like anything else.

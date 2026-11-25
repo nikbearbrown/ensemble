@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     print("numpy was not found. Install it with: python3 -m pip install numpy")
     sys.exit(1)
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ROOT = Path(__file__).resolve().parent.parent
 LOWER = {"logloss", "brier", "rmse", "mae"}          # lower is better
 METRICS = {"binary": ["logloss", "brier", "auc", "accuracy"],
@@ -356,13 +356,32 @@ def onehot_w(M, k):
     return w
 
 
+def prune(task, metric, y, S, min_gain):
+    """Backward elimination on the equal-weight average: while some member can be removed at a cost
+    under min_gain, remove the one whose removal leaves the best score. Returns equal weights on the rest."""
+    keep = list(range(S.shape[0]))
+    while len(keep) > 1:
+        cur = score(metric, task, y, S[keep].mean(axis=0))
+        trials = [(score(metric, task, y, S[[j for j in keep if j != k]].mean(axis=0)), k) for k in keep]
+        s_best, k_best = (min if metric in LOWER else max)(trials)
+        if gain(metric, s_best, cur) >= min_gain:      # even the cheapest removal costs at least min_gain
+            break
+        keep.remove(k_best)
+    w = np.zeros(S.shape[0])
+    w[keep] = 1.0 / len(keep)
+    return w
+
+
+MIN_GAIN = [0.0]          # set by cmd_blend; the pruning rule needs the bar
+
 FITTERS = {
     "single": lambda t, m, y, S: onehot_w(S.shape[0], best_single(t, m, y, S)),
     "mean": lambda t, m, y, S: np.full(S.shape[0], 1.0 / S.shape[0]),
+    "pruned": lambda t, m, y, S: prune(t, m, y, S, MIN_GAIN[0]),
     "weights": lambda t, m, y, S: fit_weights(t, y, S),
     "greedy": lambda t, m, y, S: greedy(t, m, y, S)[0],
 }
-LABEL = {"single": "best single model", "mean": "equal-weight average",
+LABEL = {"single": "best single model", "mean": "equal-weight average of all", "pruned": "equal-weight average, pruned",
          "weights": "learned weights", "greedy": "greedy selection"}
 
 
@@ -573,7 +592,9 @@ def cmd_members(a):
     R = residuals(d)
     C = np.corrcoef(R)
     M = len(d.members)
-    print("\nCorrelation of errors (1.00 means two members make the same mistakes):\n")
+    print("\nCorrelation of errors (1.00 means two members make the same mistakes). When the outcome itself is noisy,\n"
+          "every model shares that noise and all pairs read high; compare pairs with each other, and trust the\n"
+          "removal table in ./ens blend over this one:\n")
     short = [m[:10] for m in d.members]
     print(table([""] + short, [[short[i]] + [f"{C[i, j]:.2f}" for j in range(M)] for i in range(M)]))
     if M > 1:
@@ -609,6 +630,7 @@ def cmd_blend(a):
     out = [f"Project {proj.name}: {task}, metric {metric} ({direction(cfg)}), split {cfg['split']}, "
            f"{M} members, {len(d.ids)} rows, {len(d.folds)} folds.",
            f"Smallest gain worth having (min_gain, set in ensemble.json): {mg}", ""]
+    MIN_GAIN[0] = mg
     P = {m: cross_fit(d, m) for m in FITTERS}
     F = {m: fold_scores(d, P[m]) for m in FITTERS}
     base = F["single"]
@@ -634,18 +656,21 @@ def cmd_blend(a):
                "./ens verdict."
                + ("\nFolds in a time split are not exchangeable, so no test is run across them."
                   if cfg["split"] == "time" else ""))
-    # choose the simplest candidate that clears the bar
-    learned = max(("weights", "greedy"), key=lambda m: gains[m])
-    chosen, why = "single", f"no candidate beat the best single model by min_gain ({mg})"
+    # choose the simplest candidate that clears the bar: all members averaged, then a pruned
+    # average, then learned weights. Each step up must beat the one below by min_gain.
+    chosen, why, have = "single", f"no candidate beat the best single model by min_gain ({mg})", 0.0
     if gains["mean"] >= mg:
-        chosen, why = "mean", f"the equal-weight average gained {gains['mean']:+.5f}, at least min_gain"
-    if gains[learned] >= mg and gains[learned] - max(gains["mean"], 0.0) >= mg:
-        chosen = learned
-        why = (f"{LABEL[learned]} gained {gains[learned]:+.5f}, which beats the equal-weight average "
-               f"({gains['mean']:+.5f}) by at least min_gain")
-    elif chosen == "mean" and gains[learned] > gains["mean"]:
-        why += (f". {LABEL[learned].capitalize()} did {gains[learned] - gains['mean']:+.5f} better than that, "
-                "less than min_gain, so the simpler recipe stays")
+        chosen, have = "mean", gains["mean"]
+        why = f"the equal-weight average of all members gained {have:+.5f}, at least min_gain"
+    learned = max(("weights", "greedy"), key=lambda m: gains[m])
+    for m in ("pruned", learned):
+        if gains[m] >= mg and gains[m] - have >= mg:
+            why = (f"{LABEL[m]} gained {gains[m]:+.5f}, which beats {LABEL[chosen]} "
+                   f"({gains[chosen]:+.5f}) by at least min_gain")
+            chosen, have = m, gains[m]
+        elif gains[m] > have and chosen != "single":
+            why += (f". {LABEL[m].capitalize()} did {gains[m] - have:+.5f} better, less than min_gain, "
+                    "so the simpler recipe stays")
     if a.method:
         chosen, why = a.method, f"forced with --method {a.method}"
     w = FITTERS[chosen](task, metric, d.y, d.S)
@@ -673,6 +698,10 @@ def cmd_blend(a):
     lock["dev_gain"] = round(gains[chosen], 6)
     (proj / "ensemble.lock.json").write_text(json.dumps(lock, indent=2) + "\n")
     out.append(f"\nWrote ensemble.lock.json (recipe {lock['sha']}). ./ens verdict scores exactly this recipe on the holdout.")
+    used = [m for m, x in zip(d.members, w) if x > 0]
+    if chosen != "single":
+        out.append("Members to keep: " + ", ".join(used) + ". Not needed: "
+                   + (", ".join(m for m in d.members if m not in used) or "none") + ".")
     if chosen == "single":
         out.append("On this evidence the ensemble has not earned its place. Ship the single model, or find a member "
                    "that makes different mistakes.")
@@ -809,6 +838,45 @@ def cmd_lint(a):
     return 0
 
 
+def cmd_profile(a):
+    import ens_plan
+    try:
+        prof = ens_plan.profile(a.data, a.target, a.project, a.id, a.group, a.time, a.task, a.describe, a.folds, a.drop)
+    except (ValueError, RuntimeError, FileNotFoundError) as e:
+        raise Fail(str(e))
+    print(ens_plan.describe_profile(prof))
+    print(f"\nWrote {a.project}/profile.json and ensemble.json. Next: ./ens suggest {a.project}")
+    return 0
+
+
+def cmd_suggest(a):
+    import ens_plan
+    proj = Path(a.project)
+    if not (proj / "profile.json").exists():
+        raise Fail(f"No profile.json in {proj}. First: ./ens profile <data file> --target <column> --project {proj}")
+    prof = json.loads((proj / "profile.json").read_text())
+    cands, notes = ens_plan.suggest(prof)
+    ens_plan.write_plan(proj, prof, cands, notes)
+    rows = [(c["name"], c["family"], c["tier"], "build" if c["build"] else ("skip" if "skipped_because" in c else "later"),
+             c.get("skipped_because", c["differs_by"])[:88]) for c in cands]
+    print(f"Suggested models for {prof['rows']} rows, {prof['task']}. Rules of thumb from the shape of the data, not results.\n")
+    print(table(["member", "family", "tier", "", "what it brings, or why it is skipped"], rows))
+    print("\n" + "\n".join("- " + n for n in notes))
+    print(f"\nWrote {proj}/PLAN.md (the reasons in full), candidates.json and build_members.py.\n"
+          f"Next: set min_gain in {proj}/ensemble.json, then  ./ens build {proj}")
+    return 0
+
+
+def cmd_build(a):
+    proj = Path(a.project)
+    script = proj / "build_members.py"
+    if not script.exists():
+        raise Fail(f"No build_members.py in {proj}. First: ./ens suggest {proj}")
+    load_config(proj)                                  # refuses until min_gain is set
+    cmd = [sys.executable, str(script)] + (["--only", a.only] if a.only else []) + (["--list"] if a.list else [])
+    return subprocess.run(cmd).returncode
+
+
 def cmd_new(a):
     proj = Path(a.project)
     if proj.exists() and any(proj.iterdir()):
@@ -854,18 +922,31 @@ def cmd_install(a):
     return 0
 
 
-HELP = """ensemble %s: does this ensemble earn its place?
+HELP = """ensemble %s: which models to build, and whether combining them earns its place.
 
+Start from data:
+  ./ens profile <data.csv> --target <column> --project <project> [--id c] [--group c] [--time c]
+                             [--drop c1,c2] [--task t] [--describe "what is predicted, for whom, when"]
+                             reads the data: task, feature types, missing values, leak and split warnings
+  ./ens suggest <project>    which models to build first, which to hold back, which to skip, and why;
+                             writes PLAN.md, candidates.json and build_members.py
+  ./ens build <project> [--only a,b] [--list]
+                             trains the suggested models inside proper folds and writes their predictions
+
+Or start from predictions you already have:
   ./ens new <project> --task binary|multiclass|regression [--split kfold|group|time] [--metric m]
-  ./ens demo <project> [--task binary|regression]   a worked example (needs scikit-learn)
+  ./ens demo <project> [--task binary|regression]   a worked example on synthetic data
+
+Then, either way:
   ./ens check <project>      are the prediction files aligned, complete, on one scale, leak-free by fold?
   ./ens members <project>    each member alone, and whether they make the same mistakes
-  ./ens blend <project>      single vs equal average vs learned weights; picks the simplest that clears
-                             min_gain; ablation; size curve; writes ensemble.lock.json
+  ./ens blend <project>      single vs average vs pruned average vs learned weights; picks the simplest
+                             that clears min_gain; says which members to keep; writes ensemble.lock.json
   ./ens verdict <project>    scores the locked recipe once on the holdout: KEEP, TOO SMALL or NOT SHOWN
   ./ens lint <path>          reads Python for common leakage patterns (hints, not proof)
   ./ens install              link this folder into ~/.claude/skills
 
+profile, suggest and build need pandas and scikit-learn; the rest needs numpy only.
 A project is a folder of CSV files: docs/file-format.md. The rules: docs/rules.md.
 """ % VERSION
 
@@ -892,6 +973,19 @@ def main(argv=None):
     p = sub.add_parser("demo")
     p.add_argument("project")
     p.add_argument("--task", default="binary", choices=["binary", "regression"])
+    p = sub.add_parser("profile")
+    p.add_argument("data")
+    p.add_argument("--target", required=True)
+    p.add_argument("--project", required=True)
+    for opt in ("--id", "--group", "--time", "--describe", "--drop"):
+        p.add_argument(opt)
+    p.add_argument("--task", choices=list(METRICS))
+    p.add_argument("--folds", type=int, default=5)
+    sub.add_parser("suggest").add_argument("project")
+    p = sub.add_parser("build")
+    p.add_argument("project")
+    p.add_argument("--only")
+    p.add_argument("--list", action="store_true")
     sub.add_parser("install")
     sub.add_parser("help")
     a = ap.parse_args(argv)
