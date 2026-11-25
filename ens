@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ensemble command. Run ./ens help
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'python3 was not found.\n'
+  printf 'This tool needs Python 3.9 or newer and numpy ("python3 -m pip install numpy").\n'
+  exit 1
+fi
+exec python3 "$HERE/scripts/ens.py" "$@"
